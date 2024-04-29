@@ -6,16 +6,26 @@ import sys
 import numpy as np
 import pandas as pd
 import warnings
+
 sys.path.append(r"D:\PAIA\PAIA-Desktop-win32-x64-2.4.5\resources\app.asar.unpacked\games\swimming-squid-battle\ml")
 from RL_brain import QLearningTable
-from decimal import Decimal, ROUND_HALF_UP
-
+from data_utils import *
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
-class MLPlay:
+class MLPlay(RLConfig):
     def __init__(self, ai_name, *args, **kwargs):
+        super().__init__(
+            n_choose_obj=20,
+            n_precision=0,
+            run_limit_times=5,
+            score_mode=None,
+            value_range=[-3, 4],
+            reward_set=0.5,
+            learning_rate=0.04
+        )
+
         self.source_path = os.path.dirname(__file__)
         self.dataset = ""
         self.model_path = ""
@@ -23,20 +33,25 @@ class MLPlay:
         self.n_actions = len(self.action_space)
         self.loaded_q_table = None
         self._initialize()
-        self.RL = QLearningTable(actions=list(range(self.n_actions)),
-                                 learning_rate=0.04,
-                                 loaded_q_table=self.loaded_q_table)
+        self.RL = QLearningTable(
+            actions=list(range(self.n_actions)),
+            learning_rate=self.learning_rate,
+            loaded_q_table=self.loaded_q_table
+        )
         self.observation = None
         self.observation_ = None
         self.scene_info = {}
         self.coord = []
-        self.n_choose_obj = 20
         self.index = 0
         self.scores = [0, 0]
-        self.reward_set = 0.5
-        self.n_precision = 0
         self.is_run = False
         self.action = None
+        self.opponent_score = (30, 0, -50)
+        self.max_opponent_distance = 300
+        self.edge_reward = -1
+        self.map_size = (650, 600)
+        self.threshold_horizontal = 6
+        self.threshold_vertical = 5
         print("Initial ml script")
         self.RL.q_table = self.RL.removeDuplicateStates(self.RL.q_table)
         print(self.RL.q_table)
@@ -51,6 +66,7 @@ class MLPlay:
         # self.processJson("r")
         self.processPickle("r", 5000)
         self.observation = [0, 0, 0, 0]
+        self.logRLDetails(os.path.join(self.model_path, "train_config.json"))
 
     def processPickle(self, mode, chunk_size=10000):
         model_file_prefix = "model_chunk_"
@@ -69,18 +85,22 @@ class MLPlay:
         elif mode == "r":
             try:
                 chunk_files = [f for f in os.listdir(model_dir) if f.startswith(model_file_prefix)]
-                q_tables = []
-                for chunk_file in chunk_files:
-                    chunk_file = os.path.join(model_dir, chunk_file)
-                    with open(chunk_file, 'rb') as f:
-                        try:
-                            q_table_chunk = pickle.load(f)
-                            q_tables.append(q_table_chunk)
-                        except Exception as e:
-                            print("Error occur when loading the file", chunk_file)
-                            print(e)
-                self.loaded_q_table = pd.concat(q_tables)
-                print(self.loaded_q_table.shape, self.loaded_q_table.size)
+                if not len(chunk_files) == 0:
+                    q_tables = []
+                    for chunk_file in chunk_files:
+                        chunk_file = os.path.join(model_dir, chunk_file)
+                        with open(chunk_file, 'rb') as f:
+                            try:
+                                q_table_chunk = pickle.load(f)
+                                q_tables.append(q_table_chunk)
+                            except Exception as e:
+                                print("Error occur when loading the file", chunk_file)
+                                print(e)
+                    self.loaded_q_table = pd.concat(q_tables)
+                    print(self.loaded_q_table.shape, self.loaded_q_table.size)
+                else:
+                    self.loaded_q_table = None
+                    print("Create new q table")
             except IOError as e:
                 print(e)
             print("Load existed q table")
@@ -126,16 +146,6 @@ class MLPlay:
         sx, sy = [self.scene_info["self_x"], self.scene_info["self_y"]]
         return np.sqrt(np.square(sx - x) + np.square(sy - y))
 
-    def confineRange(self, array, max_value):
-        temp_array = [abs(num) for num in array]
-        max_num = max(temp_array)
-        if max_num > max_value and max_num != 0:
-            for i in range(len(array)):
-                array[i] = (float(array[i]) / float(max_num)) * max_value
-                array[i] = self.parseSpecPrecision(1, array[i], self.n_precision)
-
-        return array
-
     def classifyDirection(self, x, y):
         sx, sy = [self.scene_info["self_x"], self.scene_info["self_y"]]
         if abs(sx - x) < abs(sy - y):
@@ -149,15 +159,52 @@ class MLPlay:
             else:
                 return "RIGHT"
 
-    def parseSpecPrecision(self, n_amplify, value, n_precision):
-        if n_precision == 0:
-            return int(value * n_amplify)
-        else:
-            return round(value * n_amplify, n_precision)
+    def edgeProcess(self, features):
+        self_x = self.scene_info["self_x"]
+        self_y = self.scene_info["self_y"]
+        self_w = self.scene_info["self_w"]
+        self_h = self.scene_info["self_h"]
+        all_distance = {
+            "LEFT": abs(self_x - self_w / 2 - 25),
+            "RIGHT": abs(self.map_size[0] - (self_x + self_w / 2)),
+            "UP": abs(self_y - self_h / 2),
+            "DOWN": abs(self.map_size[1] - (self_y + self_h / 2))
+        }
+        for key in all_distance.keys():
+            features.append(
+                [
+                    all_distance[key] + 10,
+                    key,
+                    self.edge_reward
+                ]
+            )
+        return features
 
     def preprocessData(self):
         features_list = [0, 0, 0, 0]
         features = []
+
+        features = self.edgeProcess(features)
+        opponent_x = self.scene_info["opponent_x"]
+        opponent_y = self.scene_info["opponent_y"]
+        # print((opponent_x, opponent_y))
+        opponent_lv = self.scene_info["opponent_lv"]
+        self_lv = self.scene_info["self_lv"]
+        if self_lv > opponent_lv:
+            opponent_score = self.opponent_score[0]
+        elif self_lv == opponent_lv:
+            opponent_score = self.opponent_score[1]
+        else:
+            opponent_score = self.opponent_score[2]
+        opponent_distance = self._countDistance(opponent_x, opponent_y) + 1
+
+        features.append(
+            [
+                opponent_distance,
+                self.classifyDirection(opponent_x, opponent_y),
+                opponent_score
+            ]
+        )
         for food in self.scene_info["foods"]:
             score = food["score"]
             x = food["x"]
@@ -168,15 +215,17 @@ class MLPlay:
             features.append([bias_distance, direction, score])
 
         features.sort(key=lambda x: x[0])
-        self.action_space.index(features[0][1])
+        # self.action_space.index(features[0][1])
         for i in range(min(self.n_choose_obj, len(features))):
             features_list[self.action_space.index(features[i][1])] += features[i][2] / features[i][0]
 
         for i in range(len(features_list)):
-            features_list[i] = self.parseSpecPrecision(100, features_list[i], self.n_precision)
+            features_list[i] = parseSpecPrecision(100, features_list[i], self.n_precision)
 
-        features_list = self.confineRange(features_list, 5)
-
+        # print("=====\n", features_list[:min(self.n_choose_obj, len(features))])
+        # features_list = confineRange(features_list, 5, self.n_precision)
+        features_list = linearScale(features_list, self.value_range[0], self.value_range[1])
+        # print(features_list[:min(self.n_choose_obj, len(features))], "\n=====")
         features.clear()
 
         return features_list

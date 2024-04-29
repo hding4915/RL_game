@@ -1,42 +1,65 @@
-import json
 import os.path
-import pickle
-import re
 import sys
-import numpy as np
-import pandas as pd
 import warnings
+import datetime
+
 sys.path.append(r"D:\PAIA\PAIA-Desktop-win32-x64-2.4.5\resources\app.asar.unpacked\games\swimming-squid-battle\ml")
 from RL_brain import QLearningTable
-from decimal import Decimal, ROUND_HALF_UP
-
+from data_utils import *
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
-class MLPlay:
+class MLPlay(RLConfig):
     def __init__(self, ai_name, *args, **kwargs):
         self.source_path = os.path.dirname(__file__)
         self.dataset = ""
         self.model_path = ""
+        self.store_score_model_path = "final_model"
+        self.score_mode = None
         self.action_space = ['UP', 'DOWN', 'LEFT', 'RIGHT', 'NONE']
         self.n_actions = len(self.action_space)
         self.loaded_q_table = None
         self._initialize()
-        self.RL = QLearningTable(actions=list(range(self.n_actions)),
-                                 learning_rate=0.04,
-                                 loaded_q_table=self.loaded_q_table)
+
+        self.train_config_file = os.path.join(self.source_path, self.dataset, "train_config.json")
+        super().__init__(
+            read_from_file=True,
+            file_path=self.train_config_file
+        )
+        print(self.score_mode)
+        self.RL = QLearningTable(
+            actions=list(range(self.n_actions)),
+            learning_rate=self.learning_rate,
+            loaded_q_table=self.loaded_q_table
+        )
         self.observation = None
-        self.observation_ = None
         self.scene_info = {}
         self.coord = []
-        self.n_choose_obj = 20
         self.index = 0
-        self.scores = [0, 0]
-        self.reward_set = 0.5
-        self.n_precision = 0
-        self.is_run = False
+        self.average_score = 0
+        self.run_times = 0
+        self.run_limit_times = 5
+        self.average_frame_count = 0
+        self.full_frame_count = 1400
         self.action = None
+        self.opponent_score = (30, 0, -50)
+        self.max_opponent_distance = 300
+        self.edge_reward = -1
+        self.map_size = (650, 600)
+        self.threshold_horizontal = 6
+        self.threshold_vertical = 5
+
+        self.coord_computer = CoordCompute(
+            map_size=self.map_size,
+            edge_reward=self.edge_reward,
+            opponent_score=self.opponent_score,
+            n_choose_obj=self.n_choose_obj,
+            action_space=self.action_space,
+            n_precision=self.n_precision,
+            value_range=self.value_range
+        )
+
         print("Initial ml script")
         self.RL.q_table = self.RL.removeDuplicateStates(self.RL.q_table)
         print(self.RL.q_table)
@@ -45,169 +68,39 @@ class MLPlay:
         with open(os.path.join(self.source_path, "config.json"), "r") as f:
             config = json.loads(f.read())
             self.dataset = config["dataset"]
+            self.score_mode = config["mode"]
         if not os.path.exists(os.path.join(self.source_path, self.dataset)):
             os.mkdir(os.path.join(self.source_path, self.dataset))
         self.model_path = os.path.join(self.source_path, self.dataset)
-        # self.processJson("r")
-        self.processPickle("r", 5000)
+        self.loaded_q_table = processPickle(None, self.model_path, "r", 5000)
         self.observation = [0, 0, 0, 0]
-
-    def processPickle(self, mode, chunk_size=10000):
-        model_file_prefix = "model_chunk_"
-        model_dir = os.path.join(self.model_path, "q_table_chunks")
-        if not os.path.exists(model_dir):
-            os.mkdir(model_dir)
-        if mode == "w":
-            try:
-                for i in range(0, len(self.RL.q_table), chunk_size):
-                    chunk_q_table = self.RL.q_table.iloc[i:i + chunk_size]
-                    chunk_file = os.path.join(model_dir, f"{model_file_prefix}{i}.pickle")
-                    with open(chunk_file, 'wb') as f:
-                        pickle.dump(chunk_q_table, f)
-            except IOError as e:
-                print(e)
-        elif mode == "r":
-            try:
-                chunk_files = [f for f in os.listdir(model_dir) if f.startswith(model_file_prefix)]
-                q_tables = []
-                for chunk_file in chunk_files:
-                    chunk_file = os.path.join(model_dir, chunk_file)
-                    with open(chunk_file, 'rb') as f:
-                        try:
-                            q_table_chunk = pickle.load(f)
-                            q_tables.append(q_table_chunk)
-                        except Exception as e:
-                            print("Error occur when loading the file", chunk_file)
-                            print(e)
-                self.loaded_q_table = pd.concat(q_tables)
-                print(self.loaded_q_table.shape, self.loaded_q_table.size)
-            except IOError as e:
-                print(e)
-            print("Load existed q table")
-
-    def processJson(self, mode):
-        model_file = os.path.join(self.model_path, "model.json")
-        if mode == "w":
-            try:
-                self.RL.q_table.to_json(model_file)
-            except IOError as e:
-                print(e)
-        elif mode == "r":
-            if not os.path.exists(model_file):
-                self.loaded_q_table = None
-                print("Create new q table")
-            else:
-                try:
-                    print(f"Read from the file {model_file}")
-                    self.loaded_q_table = pd.read_json(model_file, encoding="utf-8")
-                except IOError as e:
-                    print(e)
-                print("Load existed q table")
-
-    def processHdf(self, mode):
-        model_file = os.path.join(self.model_path, "model.h5")
-        if mode == "w":
-            try:
-                self.RL.q_table.to_hdf(model_file, key="q_table", mode=mode)
-            except IOError as e:
-                print(e)
-        elif mode == "r":
-            if not os.path.exists(model_file):
-                self.loaded_q_table = None
-                print("Create new q table")
-            else:
-                try:
-                    self.loaded_q_table = pd.read_hdf(model_file, key="q_table", mode=mode)
-                except IOError as e:
-                    print(e)
-                print("Load existed q table")
-
-    def _countDistance(self, x, y):
-        sx, sy = [self.scene_info["self_x"], self.scene_info["self_y"]]
-        return np.sqrt(np.square(sx - x) + np.square(sy - y))
-
-    def confineRange(self, array, max_value):
-        temp_array = [abs(num) for num in array]
-        max_num = max(temp_array)
-        if max_num > max_value and max_num != 0:
-            for i in range(len(array)):
-                array[i] = (float(array[i]) / float(max_num)) * max_value
-                array[i] = self.parseSpecPrecision(1, array[i], self.n_precision)
-
-        return array
-
-    def classifyDirection(self, x, y):
-        sx, sy = [self.scene_info["self_x"], self.scene_info["self_y"]]
-        if abs(sx - x) < abs(sy - y):
-            if y < sy:
-                return "UP"
-            else:
-                return "DOWN"
-        else:
-            if x < sx:
-                return "LEFT"
-            else:
-                return "RIGHT"
-
-    def parseSpecPrecision(self, n_amplify, value, n_precision):
-        if n_precision == 0:
-            return int(value * n_amplify)
-        else:
-            return round(value * n_amplify, n_precision)
-
-    def preprocessData(self):
-        features_list = [0, 0, 0, 0]
-        features = []
-        for food in self.scene_info["foods"]:
-            score = food["score"]
-            x = food["x"]
-            y = food["y"]
-            distance = self._countDistance(x, y)
-            bias_distance = distance + 1
-            direction = self.classifyDirection(x, y)
-            features.append([bias_distance, direction, score])
-
-        features.sort(key=lambda x: x[0])
-        self.action_space.index(features[0][1])
-        for i in range(min(self.n_choose_obj, len(features))):
-            features_list[self.action_space.index(features[i][1])] += features[i][2] / features[i][0]
-
-        for i in range(len(features_list)):
-            features_list[i] = self.parseSpecPrecision(100, features_list[i], self.n_precision)
-
-        features_list = self.confineRange(features_list, 5)
-
-        features.clear()
-
-        return features_list
 
     def update(self, scene_info: dict, keyboard: list = [], *args, **kwargs):
         self.scene_info = scene_info
-        if not self.is_run:
-            self.observation = self.preprocessData()
-            self.action = self.RL.choose_action(str(self.observation))
-            self.scores[1] = self.scene_info["score"]
-            self.is_run = True
-        else:
-            self.scores[0] = self.scores[1]
-            self.scores[1] = self.scene_info["score"]
-            self.observation_ = self.preprocessData()
-            reward = self.scores[1] - self.scores[0]
-            if self.action < len(self.observation):
-                additional_reward = self.observation[self.action]
-            else:
-                additional_reward = 0
-            reward += self.reward_set * additional_reward
-            # print(reward)
-            status = self.scene_info["status"]
-            self.RL.learn(str(self.observation), self.action, reward, str(self.observation_))
-            self.observation = self.observation_
-            # print(self.observation)
-            self.action = self.RL.choose_action(str(self.observation))
-            if status == "GAME_PASS" or status == "GAME_OVER":
-                print(self.RL.q_table)
-                print(f"Shape: {self.RL.q_table.shape}")
-                self.processPickle("w", 5000)
+        self.coord_computer.setSceneInfo(scene_info)
+        self.observation = self.coord_computer.preprocessData()
+        self.action = self.RL.choose_action(str(self.observation))
+        status = self.scene_info["status"]
+        if status == "GAME_PASS" or status == "GAME_OVER":
+            if self.score_mode == "score":
+                score = self.scene_info["score"]
+                frame_count = self.full_frame_count - self.scene_info["frame"]
+                self.average_frame_count += frame_count
+                self.average_score += score
+                self.run_times += 1
+                if self.run_times > self.run_limit_times:
+                    self.average_score = int(self.average_score / self.run_times)
+                    self.average_frame_count = int(self.average_frame_count / self.run_times)
+                    self.model_path = os.path.join(self.source_path, self.store_score_model_path)
+                    if not os.path.exists(self.model_path):
+                        os.mkdir(self.model_path)
+                    today = datetime.datetime.today().strftime("%Y_%m_%d_%H_%M_%S")
+                    self.model_path = os.path.join(self.model_path,
+                                                   f"model_score_{self.average_score}_frame_{self.average_frame_count}_{today}")
+                    if not os.path.exists(self.model_path):
+                        os.mkdir(self.model_path)
+                    processPickle(self.RL.q_table, self.model_path, "w", 5000)
+                    exit(0)
 
         return [self.action_space[self.action]]
 
